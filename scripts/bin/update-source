@@ -1,0 +1,338 @@
+#!/bin/bash
+
+CURRENT_OS=$(uname)
+MAX_ACTIVE_TASKS=4
+
+check_opengrok_config() {
+
+  git config --global user.name "Ondrej Kubik"
+  git config --global user.email "ondrej.kubik@canonical.com"
+}
+
+pull_bzr_branch() {
+    BRANCH_DIRECTORY=$1
+    bzr pull --directory $BRANCH_DIRECTORY  > /dev/null
+}
+
+git_force_ubuntu_checkout() {
+    # possible branches ubuntu/xenial ubuntu/xenial-devel  ubuntu/xenial-proposed ubuntu/xenial-updates
+
+    # check if there is update branch and use tha one instead
+    echo "git_force_ubuntu_checkout:<<< $PWD"
+    if [ -n "$(git branch -a | grep 'ubuntu/${SERIES}-updates')" ]; then
+        git checkout -f origin/ubuntu/${SERIES}-updates
+    else
+        git checkout -f origin/ubuntu/${SERIES}
+    fi
+    echo "git_force_ubuntu_checkout:>>>"
+}
+
+sync_package_src() {
+    echo -e "sync_package_src:<<< $1 $2"
+    PACKAGE=$1
+    SERIES="xenial"
+    [ -n "$2" ] && SERIES=$2
+
+    # ignore certain branches, since they don't carry any value for indexing
+    for pkg in $OG_IGNORE_PROJECTS
+    do
+            if [[ $PACKAGE == $pkg ]]; then
+            echo "sync_package_src: ${PACKAGE}: ignoring package"
+            echo "Ignoring package: $PACKAGE" >> .repositories-ignored.log
+            echo "sync_package_src:>>> ${PACKAGE}"
+            return
+        fi
+    done
+
+    # try to get source package from package info
+    for suite in '' '-updates' '-backports';
+    do
+        SOURCE_PACKAGE=$(curl -s https://packages.ubuntu.com/${SERIES}${suite}/${PACKAGE} | grep 'Source Package' | sed -e 's/.*\">\(.*\)<\/a>.*/\1/')
+        if [ -n  "${SOURCE_PACKAGE}" ]; then
+            echo "sync_package_src: ${PACKAGE}: using source package ${SOURCE_PACKAGE}"
+            if [ -n "$(curl -s --head https://git.launchpad.net/ubuntu/+source/${SOURCE_PACKAGE} |  head -n 1 | grep '200 OK')" ]; then
+                # check if we already have code for this source package
+                if [ -e ${SOURCE_PACKAGE}/.git ]; then
+                    echo "sync_package_src: ${PACKAGE}: re-using existing, repo ${SOURCE_PACKAGE}"
+                    cd ${SOURCE_PACKAGE}
+                    git fetch
+                    git_force_ubuntu_checkout
+                    cd ..
+                    # existing repo synced
+                    echo "sync_package_src:>>> ${PACKAGE}"
+                    return
+                else
+                    # example https://git.launchpad.net/ubuntu/+source/ifupdown  -b ubuntu/xenial ubuntu/xenial-devel  ubuntu/xenial-proposed ubuntu/xenial-updates
+                    echo "sync_package_src: ${PACKAGE}: git clone https://git.launchpad.net/ubuntu/+source/${SOURCE_PACKAGE} --branch ubuntu/${SERIES} ${SOURCE_PACKAGE}"
+                    git clone https://git.launchpad.net/ubuntu/+source/${SOURCE_PACKAGE} --branch ubuntu/${SERIES} ${SOURCE_PACKAGE}
+                    if [ -e ${SOURCE_PACKAGE} ]; then
+                        git_force_ubuntu_checkout
+                        echo "sync_package_src:>>> ${PACKAGE}"
+                        return
+                    else
+                        echo "sync_package_src: ${PACKAGE}: git clone failed"
+                    fi
+                fi
+            else
+                echo "sync_package_src: ${PACKAGE}: source package ${SOURCE_PACKAGE} does not have valid git remote repository"
+            fi
+        fi
+    done
+    [ -z "${SOURCE_PACKAGE}" ] && SOURCE_PACKAGE=${PACKAGE}
+    if [ ! -d ${SOURCE_PACKAGE} ]; then
+        echo "sync_package_src: $PACKAGE: !!! Cannot find source !!!"
+        echo "$PACKAGE" >> .repositories-missing.log
+    fi
+    echo "sync_package_src:>>> ${PACKAGE}"
+}
+
+# Watch your stable of backgrounded processes.
+# If a pid goes away, remove it from the array.
+wait_for_task_to_finish() {
+    ALL=0
+    TASK_DONE=0
+    if [[ -n "$1" && "$1" == "ALL" ]]; then
+        ALL=1
+    fi
+    while [ -n "${pids[*]}" ]; do
+        for pid in "${!pids[@]}"; do
+            if ! ps "$pid" >/dev/null; then
+                echo "Finished: ${pids[$pid]}"
+                unset pids[$pid]
+                let ACTIVE_TASKS--
+                if [ $ALL == 0 ]; then
+                    TASK_DONE=1
+                    break
+                fi
+            fi
+        done
+        if [ -z "${!pids[*]}" ]; then
+            break
+        fi
+        if [ $TASK_DONE == 1 ]; then
+            break;
+        fi
+        sleep 1
+    done
+}
+
+is_ready_for_next() {
+    if [[ "$ACTIVE_TASKS" -gt "$MAX_ACTIVE_TASKS" ]]; then
+        wait_for_task_to_finish
+    fi
+}
+
+get_source_for_packages() {
+    echo -e "get_source_for_packages:<<< $1 $2 $3 $4"
+    SERIES=$1; shift
+    while [ -n "$1" ]
+    do
+        PACKAGE=$1
+        shift
+        is_ready_for_next
+#        sync_package_src $PACKAGE $SERIES &
+        sync_package_src $PACKAGE $SERIES
+#        pid=$!
+#        pids[$pid]=$PACKAGE
+#        let ACTIVE_TASKS++
+    done
+}
+
+prepare_project_pushd() {
+    PROJECT_DIR=$1
+    mkdir -p $PROJECT_DIR
+    pushd $PROJECT_DIR >&1>&/dev/null
+}
+
+
+sync_single_package() {
+    prepare_project_pushd $1
+    shift
+    sync_package_src $1 $2
+    popd >&1>&/dev/null # prepare_project_pushd $1
+}
+
+sync_manifest() {
+    prepare_project_pushd $1
+    shift
+    MANIFEST=$1
+    shift
+    if [ -n "$1" ];then
+        SERIES=$1
+    else
+        # we have no series, check if we can guess it from url
+        if [ -n $(echo "$MANIFEST" | grep yakety) ]; then
+            SERIES="yakety"
+        elif [ -n $(echo "$MANIFEST" | grep xenial) ]; then
+            SERIES="xenial"
+        elif [ -n $(echo "$MANIFEST" | grep wily) ]; then
+            SERIES="wily"
+        elif [ -n $(echo "$MANIFEST" | grep vivid) ]; then
+            SERIES="vivid"
+        elif [ -n $(echo "$MANIFEST" | grep utopic) ]; then
+            SERIES="utopic"
+        elif [ -n $(echo "$MANIFEST" | grep trusty) ]; then
+            SERIES="trusty"
+        else
+            SERIES="saucy"
+        fi
+    fi
+    curl -s $MANIFEST > package.manifest
+    PACKAGES="$(awk -F':' '{print $1}' package.manifest | awk '{print $1}')"
+    get_source_for_packages $SERIES $PACKAGES
+    popd >&1>&/dev/null # prepare_project_pushd $1
+}
+
+clean_project() {
+    rm -rf $1
+}
+
+sync_germinate_list() {
+    PROJECT_DIR=$1
+    shift
+    SOURCE_LIST_BASE=$1
+    SERIES=$(echo "$SOURCE_LIST_BASE" | awk 'BEGIN {FS="."}{print $NF}')
+    shift
+    PACKAGES=""
+    while [ -n "$1" ]
+    do
+        curl -s $SOURCE_LIST_BASE/$1 > $1
+        PACKAGES+=" "$(cat $1 | awk '{ print $1}' | grep -v Source | grep -ve "------+------")
+        rm $1
+        shift
+    done
+    sync_packages $PROJECT_DIR $SERIES $PACKAGES
+}
+
+sync_packages() {
+  echo -e "sync_packages:<<< $1 $2 $3 $4"
+  prepare_project_pushd $1
+  shift
+  SERIES=$1
+  shift
+  echo -e "sync_packages: series: ${SERIES}"
+  get_source_for_packages $SERIES $@
+  popd >&1>&/dev/null # prepare_project_pushd $1
+}
+
+sync_repo_branch() {
+    echo "sync_repo_branch:<<< $1 $2 $3"
+    R_DIR=$1
+    R_SERVER=$2
+    R_BRANCH=$3
+    if [ -e $R_DIR ]; then
+        pushd $R_DIR >&1>&/dev/null
+        repo sync -j7
+        popd >&1>&/dev/null
+    else
+        mkdir -p $R_DIR
+        pushd $R_DIR >&1>&/dev/null
+        if [ -z "$R_BRANCH" ]; then
+            repo init -u $R_SERVER
+        else
+            repo init -u $R_SERVER -b $R_BRANCH
+        fi
+        repo sync -j7
+        popd >&1>&/dev/null # R_DIR
+    fi
+    echo "sync_repo_branch:>>> $1"
+}
+
+sync_git_branch() {
+    echo "sync_git_branch:<<< $1 $2 $3"
+    GIT_DIR=$1
+    GIT_URL=$2
+    GIT_BRANCH=$3
+    if [ -e $GIT_DIR/.git ]; then
+        pushd ${GIT_DIR} >&1>&/dev/null
+        git fetch
+        if [ -z "$GIT_BRANCH" ]; then
+            git reset --hard origin/HEAD
+        else
+            git checkout -f origin/${GIT_BRANCH}
+        fi
+        popd >&1>&/dev/null
+    else
+        if [ -e $GIT_DIR ]; then
+            rm -rf $GIT_DIR
+        fi
+        if [ -z "$GIT_BRANCH" ]; then
+            git clone ${GIT_URL} $GIT_DIR &
+            pid=$!
+        else
+            git clone ${GIT_URL} -b ${GIT_BRANCH} ${GIT_DIR} &
+            pid=$!
+        fi
+        pids[$pid]=$GIT_DIR
+    fi
+    echo "sync_git_branch:>>> $1"
+}
+
+do_sync_single_bzr_branch() {
+    B_DIR=$1
+    B_BRANCH=$2
+    echo "Checking bzr branch:$B_BRANCH"
+    if [ -d $B_DIR ]; then
+        pull_bzr_branch $B_DIR &
+    else
+        bzr branch $B_BRANCH $B_DIR >&1>&/dev/null &
+    fi
+}
+
+
+sync_single_bzr_branch() {
+    do_sync_single_bzr_branch $*
+    pid=$!
+    pids[$pid]=$B_BRANCH
+    let ACTIVE_TASKS++
+}
+
+# do sync all the code
+do_sync_all_source() {
+    mkdir -p src
+    # get into target folder
+    pushd src >&1>&/dev/null
+
+    # remove sync logs first
+    find . -name ".repositories-*.log" -exec rm {} \;
+
+    # Sync all code
+    if [[ ! -e ../source.conf ]]; then
+        echo "Source configuration missing"
+        exit 0;
+    fi
+    unset pids
+    unset pid
+    source  ../source.conf
+    wait_for_task_to_finish ALL
+    echo "All code is synced, refresh index"
+
+    # sort and clean logs
+    find . -maxdepth 2 -name ".repositories-*.log" -exec bash -c ' sort {} | uniq > {}' \;
+
+    popd >&1>&/dev/null # src
+}
+
+# Sync all code
+sync_all_source() {
+    pushd $OPENGROK_INSTANCE_BASE >&1>&/dev/null
+        do_sync_all_source
+    popd >&1>&/dev/null # $OPENGROK_INSTANCE_BASE
+}
+
+run_opengrok() {
+    if [ -n "$1" ]; then
+        echo "Calling OpenGrok $1"
+        eval $OPENGROK_EXEC_PREFIX $OPENGROK_EXECUTABLE $@
+    else
+        echo "Updating index"
+        eval $OPENGROK_EXEC_PREFIX $OPENGROK_EXECUTABLE update
+        eval $OPENGROK_EXEC_PREFIX $OPENGROK_EXECUTABLE deploy
+    fi
+    echo "All code indexed"
+}
+
+
+# build/refresh index
+# sync_all_source
+# run_opengrok

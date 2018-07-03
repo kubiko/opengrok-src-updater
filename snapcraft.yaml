@@ -1,0 +1,23 @@
+name: opengrok-src-updater
+version: "0.5"
+summary: source code sync configuration for opengrok
+description: |
+ source sync configuration for opengrok snap
+
+architectures:
+    - all
+
+confinement: strict
+grade: stable
+
+slots:
+  src-updater:
+    interface: content
+    read:
+      - $SNAP/bin
+      
+parts:
+    # helper scripts
+    helpers:
+        source: scripts
+        plugin: dump
