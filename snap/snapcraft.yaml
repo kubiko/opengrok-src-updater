@@ -1,5 +1,5 @@
 name: opengrok-src-updater
-version: "0.5"
+version: "0.9"
 summary: source code sync configuration for opengrok
 description: |
  source sync configuration for opengrok snap
@@ -9,6 +9,7 @@ architectures:
 
 confinement: strict
 grade: stable
+base: core18
 
 slots:
   src-updater:
