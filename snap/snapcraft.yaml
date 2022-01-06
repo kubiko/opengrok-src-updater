@@ -9,7 +9,7 @@ architectures:
 
 confinement: strict
 grade: stable
-base: core18
+base: core20
 
 slots:
   src-updater:
